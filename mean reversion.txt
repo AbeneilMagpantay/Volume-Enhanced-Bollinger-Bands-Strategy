@@ -1,0 +1,97 @@
+//@version=5
+strategy("Volume-Enhanced Bollinger Bands Strategy", overlay=true, max_labels_count=100, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// === Inputs ===
+bbLen = input.int(20, minval=1, title="Bollinger Band Length")
+bbMult = input.float(2.0, minval=0.1, title="BB StdDev Multiplier")
+volPercLen = input.int(100, minval=1, title="Volume Percentile Length")
+percThreshold = input.int(80, minval=0, maxval=100, title="Volume Percentile Threshold")
+zLen = input.int(20, minval=1, title="Volume Z-Score Length")
+obvShortLen = input.int(6, minval=1, title="OBV Short EMA")
+obvLongLen = input.int(20, minval=1, title="OBV Long EMA")
+slPerc = input.float(2.0, minval=0.1, title="Stop Loss (%)")
+
+// === Bollinger Bands ===
+basis = ta.sma(close, bbLen)
+dev = ta.stdev(close, bbLen)
+upper = basis + bbMult * dev
+lower = basis - bbMult * dev
+plot(basis, "BB Basis", color=color.blue)
+p1 = plot(upper, "BB Upper", color=color.orange)
+p2 = plot(lower, "BB Lower", color=color.orange)
+fill(p1, p2, color=color.new(color.orange, 90))
+
+// === Volume Percentile ===
+limit = math.min(volPercLen - 1, bar_index)
+float count = 0.0
+for i = 0 to limit
+    count := count + (volume >= volume[i] ? 1.0 : 0.0)
+volPercent = limit > 0 ? (count / (limit + 1) * 100.0) : na
+
+// === Volume Z-score ===
+vol_mean = ta.sma(volume, zLen)
+vol_stdev = ta.stdev(volume, zLen)
+vol_z = vol_stdev != 0 ? (volume - vol_mean) / vol_stdev : 0.0
+
+// === OBV Momentum ===
+var float obv = 0.0
+obv := na(obv[1]) ? 0 : obv[1] + (close > close[1] ? volume : close < close[1] ? -volume : 0)
+obv_short = ta.ema(obv, obvShortLen)
+obv_long = ta.ema(obv, obvLongLen)
+obv_mom = obv_short - obv_long
+
+// === Signal Conditions ===
+condBuy = close < lower
+condSell = close > upper
+volHigh = volPercent >= percThreshold
+
+strongBuy = condBuy and volHigh and obv_mom > 0
+weakBuy   = condBuy and obv_mom > 0 and not strongBuy
+
+strongSell = condSell and volHigh and obv_mom < 0
+weakSell   = condSell and obv_mom < 0 and not strongSell
+
+// === Entries ===
+if (strongBuy)
+    strategy.entry("Long", strategy.long)
+
+if (strongSell)
+    strategy.entry("Short", strategy.short)
+
+// === Stop Loss ===
+longSL  = close * (1 - slPerc / 100)
+shortSL = close * (1 + slPerc / 100)
+
+if strategy.position_size > 0
+    strategy.exit("Exit Long SL", from_entry="Long", stop=longSL)
+if strategy.position_size < 0
+    strategy.exit("Exit Short SL", from_entry="Short", stop=shortSL)
+
+// === Midline Exit: Close when price returns to Bollinger midline ===
+if strategy.position_size > 0 and close > basis
+    strategy.close("Long", comment="Midline Exit")
+
+if strategy.position_size < 0 and close < basis
+    strategy.close("Short", comment="Midline Exit")
+
+// === Labels ===
+volText = str.tostring(math.round(volPercent)) + "%"
+zText = str.tostring(math.round(vol_z * 10) / 10.0)
+obvText = str.tostring(math.round(obv_mom))
+
+if strongBuy
+    label.new(bar_index, low, "Strong Buy\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
+         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up,
+         color=color.new(color.green, 0), textcolor=color.white)
+if weakBuy
+    label.new(bar_index, low, "Weak Buy\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
+         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up,
+         color=color.new(color.green, 80), textcolor=color.white)
+if strongSell
+    label.new(bar_index, high, "Strong Sell\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
+         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down,
+         color=color.new(color.red, 0), textcolor=color.white)
+if weakSell
+    label.new(bar_index, high, "Weak Sell\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
+         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down,
+         color=color.new(color.red, 80), textcolor=color.white)
