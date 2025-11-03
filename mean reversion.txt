@@ -1,97 +1,228 @@
-//@version=5
-strategy("Volume-Enhanced Bollinger Bands Strategy", overlay=true, max_labels_count=100, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+//@version=6
+strategy("Volume-Enhanced Bollinger Bands v2.5 (Explicit Size + Static TP/SL + Cooldown + Modes)",
+     overlay=true,
+     max_labels_count=300,
+     default_qty_type=strategy.fixed,
+     commission_type=strategy.commission.percent,
+     commission_value=0.04,   // Binance taker by default
+     slippage=2)
 
-// === Inputs ===
-bbLen = input.int(20, minval=1, title="Bollinger Band Length")
-bbMult = input.float(2.0, minval=0.1, title="BB StdDev Multiplier")
-volPercLen = input.int(100, minval=1, title="Volume Percentile Length")
-percThreshold = input.int(80, minval=0, maxval=100, title="Volume Percentile Threshold")
-zLen = input.int(20, minval=1, title="Volume Z-Score Length")
+// -------------------- USER / RISK SETTINGS --------------------
+starting_equity = input.float(10000, "Starting Equity ($)", tooltip="Used only for explicit sizing calculation")
+risk_per_trade  = input.float(0.5, "Risk per Trade (%)", step=0.01, tooltip="Percent of starting_equity used for position size")
+default_leverage = input.int(1, "Leverage (informational)", minval=1)
+
+useATR = input.bool(false, title="Use ATR-based SL/TP instead of %")
+atrLen = input.int(14, minval=1, title="ATR Length (if ATR mode)")
+atrSLmult = input.float(1.0, minval=0.1, step=0.1, title="ATR SL multiplier")
+atrTPmult = input.float(2.0, minval=0.1, step=0.1, title="ATR TP multiplier")
+slPercDefault = input.float(0.5, minval=0.01, step=0.01, title="Stop Loss (%) (if % mode)")
+tpPercDefault = input.float(1.0, minval=0.01, step=0.01, title="Take Profit (%) (if % mode)")
+
+// -------------------- SIGNAL / INDICATOR INPUTS --------------------
+bbLen   = input.int(20, minval=1, title="BB Length")
+bbMult  = input.float(2.0, minval=0.1, step=0.1, title="BB StdDev Multiplier")
+volPercLen     = input.int(100, minval=1, title="Volume Percentile Length")
+percThreshold  = input.int(80, minval=0, maxval=100, title="Volume Percentile Threshold")
+zLen           = input.int(20,  minval=1, title="Volume Z-Score Length")
+zThreshold     = input.float(1.5, minval=0, step=0.1, title="Volume Z-Score Threshold")
+volRatioMin    = input.float(1.2, minval=0.01, step=0.01, title="Volume Ratio Minimum (vol/MA)")
 obvShortLen = input.int(6, minval=1, title="OBV Short EMA")
-obvLongLen = input.int(20, minval=1, title="OBV Long EMA")
-slPerc = input.float(2.0, minval=0.1, title="Stop Loss (%)")
+obvLongLen  = input.int(20, minval=1, title="OBV Long EMA")
 
-// === Bollinger Bands ===
+// Trend filter inputs
+useTrendFilter = input.bool(true, title="Use EMA Trend Filter")
+emaSlowLen = input.int(200, minval=5, title="EMA Slow Length (e.g. 200)")
+showFastEMA = input.bool(true, title="Show fast EMA (e.g. 36)")
+
+// Volume confirmation mode: 0=ANY(OR),1=ANY 2-OF-3,2=ALL(AND)
+volMode = input.int(0, "Volume Confirm Mode (0=OR,1=2-of-3,2=AND)", minval=0, maxval=2)
+
+// -------------------- COOLDOWN / ADAPTIVE SETTINGS --------------------
+useCooldown = input.bool(true, "Use Cooldown Between Trades")
+cooldownBarsStatic = input.int(10, "Cooldown Bars (static)", minval=0, tooltip="Number of bars to wait after entry before next entry allowed")
+useAdaptiveCooldown = input.bool(true, "Adaptive cooldown (based on volatility)", tooltip="When enabled, cooldown reduces on high ATR and increases on low ATR.")
+adaptive_min = input.int(2, "Adaptive min bars", minval=0)
+adaptive_max = input.int(20, "Adaptive max bars", minval=1)
+
+// -------------------- DISPLAY --------------------
+showLabels = input.bool(true, title="Show Signal Labels")
+showVolOverlay = input.bool(false, title="Show Volume Ratio Overlay")
+showStatsTable = input.bool(true, title="Show Signal Counts Table")
+
+// -------------------- CORE INDICATORS --------------------
 basis = ta.sma(close, bbLen)
-dev = ta.stdev(close, bbLen)
+dev   = ta.stdev(close, bbLen)
 upper = basis + bbMult * dev
 lower = basis - bbMult * dev
-plot(basis, "BB Basis", color=color.blue)
-p1 = plot(upper, "BB Upper", color=color.orange)
-p2 = plot(lower, "BB Lower", color=color.orange)
-fill(p1, p2, color=color.new(color.orange, 90))
 
-// === Volume Percentile ===
-limit = math.min(volPercLen - 1, bar_index)
-float count = 0.0
-for i = 0 to limit
-    count := count + (volume >= volume[i] ? 1.0 : 0.0)
-volPercent = limit > 0 ? (count / (limit + 1) * 100.0) : na
+plot(basis, "BB Basis", color=color.new(color.blue, 0), linewidth=2)
+plot(upper, "BB Upper", color=color.new(color.orange, 0), linewidth=1)
+plot(lower, "BB Lower", color=color.new(color.orange, 0), linewidth=1)
+fill(plot(upper), plot(lower), color=color.new(color.orange, 90))
 
-// === Volume Z-score ===
-vol_mean = ta.sma(volume, zLen)
-vol_stdev = ta.stdev(volume, zLen)
-vol_z = vol_stdev != 0 ? (volume - vol_mean) / vol_stdev : 0.0
+// Volume measures
+volPercent = ta.percentrank(volume, volPercLen)
+vol_mean   = ta.sma(volume, zLen)
+vol_stdev  = ta.stdev(volume, zLen)
+vol_z      = vol_stdev != 0 ? (volume - vol_mean) / vol_stdev : 0.0
+vol_ma     = ta.sma(volume, bbLen)
+vol_ratio  = vol_ma != 0 ? volume / vol_ma : 1.0
+plot(showVolOverlay ? vol_ratio : na, "Vol Ratio", style=plot.style_histogram, linewidth=2)
 
-// === OBV Momentum ===
-var float obv = 0.0
-obv := na(obv[1]) ? 0 : obv[1] + (close > close[1] ? volume : close < close[1] ? -volume : 0)
+// OBV momentum
+obv = ta.cum(math.sign(ta.change(close)) * volume)
 obv_short = ta.ema(obv, obvShortLen)
-obv_long = ta.ema(obv, obvLongLen)
-obv_mom = obv_short - obv_long
+obv_long  = ta.ema(obv, obvLongLen)
+obv_mom   = obv_short - obv_long
+obv_mom_normalized = obv_long != 0 ? obv_mom / obv_long * 100 : 0.0
 
-// === Signal Conditions ===
-condBuy = close < lower
-condSell = close > upper
-volHigh = volPercent >= percThreshold
+// Trend EMAs visible
+emaSlow = ta.ema(close, emaSlowLen)
+plot(emaSlow, title="EMA Slow", color=color.new(color.yellow, 0), linewidth=2)
 
-strongBuy = condBuy and volHigh and obv_mom > 0
-weakBuy   = condBuy and obv_mom > 0 and not strongBuy
+// ATR for SL/TP and adaptive cooldown
+atr = ta.atr(atrLen)
 
-strongSell = condSell and volHigh and obv_mom < 0
-weakSell   = condSell and obv_mom < 0 and not strongSell
+// precompute cross checks
+crossOverBasis = ta.crossover(close, basis)
+crossUnderBasis = ta.crossunder(close, basis)
 
-// === Entries ===
-if (strongBuy)
-    strategy.entry("Long", strategy.long)
+// -------------------- SIGNAL LOGIC --------------------
+priceTouchLower = close <= lower
+priceTouchUpper = close >= upper
 
-if (strongSell)
-    strategy.entry("Short", strategy.short)
+volHighPercentile = volPercent >= percThreshold
+volHighZScore     = vol_z >= zThreshold
+volHighRatio      = vol_ratio >= volRatioMin
 
-// === Stop Loss ===
-longSL  = close * (1 - slPerc / 100)
-shortSL = close * (1 + slPerc / 100)
+// choose mode
+volStrongConfirm = 
+     volMode == 0 ? (volHighPercentile or volHighRatio or volHighZScore) :    // OR any
+     volMode == 1 ? ((volHighPercentile and volHighZScore) or (volHighPercentile and volHighRatio) or (volHighZScore and volHighRatio)) :  // 2-of-3
+     (volHighPercentile and volHighZScore and volHighRatio)  // AND all
 
-if strategy.position_size > 0
-    strategy.exit("Exit Long SL", from_entry="Long", stop=longSL)
-if strategy.position_size < 0
-    strategy.exit("Exit Short SL", from_entry="Short", stop=shortSL)
+obvBullish = obv_mom > 0
+obvBearish = obv_mom < 0
 
-// === Midline Exit: Close when price returns to Bollinger midline ===
-if strategy.position_size > 0 and close > basis
-    strategy.close("Long", comment="Midline Exit")
+strongBuySignalRaw  = priceTouchLower and volStrongConfirm and obvBullish
+strongSellSignalRaw = priceTouchUpper and volStrongConfirm and obvBearish
 
-if strategy.position_size < 0 and close < basis
-    strategy.close("Short", comment="Midline Exit")
+strongBuySignal  = useTrendFilter ? (strongBuySignalRaw and close > emaSlow) : strongBuySignalRaw
+strongSellSignal = useTrendFilter ? (strongSellSignalRaw and close < emaSlow) : strongSellSignalRaw
 
-// === Labels ===
-volText = str.tostring(math.round(volPercent)) + "%"
-zText = str.tostring(math.round(vol_z * 10) / 10.0)
-obvText = str.tostring(math.round(obv_mom))
+// -------------------- EXPLICIT POSITION SIZING --------------------
+// trade value is a fraction of starting_equity (explicit sizing)
+trade_value = starting_equity * (risk_per_trade / 100)
+qty = math.max(1e-8, trade_value / close)  // non-zero tiny floor for display
 
-if strongBuy
-    label.new(bar_index, low, "Strong Buy\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
-         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up,
-         color=color.new(color.green, 0), textcolor=color.white)
-if weakBuy
-    label.new(bar_index, low, "Weak Buy\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
-         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up,
-         color=color.new(color.green, 80), textcolor=color.white)
-if strongSell
-    label.new(bar_index, high, "Strong Sell\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
-         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down,
-         color=color.new(color.red, 0), textcolor=color.white)
-if weakSell
-    label.new(bar_index, high, "Weak Sell\nVol%: " + volText + "\nZ: " + zText + "\nOBV: " + obvText,
-         xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down,
-         color=color.new(color.red, 80), textcolor=color.white)
+// -------------------- COOLDOWN IMPLEMENTATION --------------------
+var int lastTradeBar = na
+// static cooldown baseline
+cooldownStatic = cooldownBarsStatic
+
+// adaptive cooldown: map recent ATR / basis to a cooldown between adaptive_min and adaptive_max
+// Normalize ratio = atr / basis; map into adaptive range
+atrRatio = atr / math.max(basis, 1e-8)
+normalized = math.min(1.0, atrRatio / 0.001)  // 0.001 chosen as normalization factor (tunable)
+adaptiveCooldown = math.round(adaptive_min + (1 - normalized) * (adaptive_max - adaptive_min))
+
+// final cooldown used this bar
+cooldownUse = useAdaptiveCooldown ? adaptiveCooldown : cooldownStatic
+canTrade = not useCooldown or na(lastTradeBar) or (bar_index - lastTradeBar > cooldownUse)
+
+// show cooldown status label (optional)
+var label cooldownLabel = na
+if useCooldown
+    if not canTrade
+        // create or move label
+        if na(cooldownLabel)
+            cooldownLabel := label.new(bar_index, high, "COOLDOWN", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_left, color=color.new(color.gray, 80), textcolor=color.white)
+        else
+            label.set_xy(cooldownLabel, bar_index, high)
+            label.set_text(cooldownLabel, "COOLDOWN (" + str.tostring(cooldownUse) + " bars)")
+    else
+        if not na(cooldownLabel)
+            label.delete(cooldownLabel)
+            cooldownLabel := na
+
+// -------------------- ENTRY / STATIC TP-SL --------------------
+var float entry_price_long = na
+var float entry_price_short = na
+var float long_tp = na
+var float long_sl = na
+var float short_tp = na
+var float short_sl = na
+
+// For stats
+var int totalStrongBuy = 0
+var int totalStrongSell = 0
+
+// Long entry (only when no position and cooldown passed)
+if strongBuySignal and strategy.position_size == 0 and canTrade
+    // record last trade bar for cooldown
+    lastTradeBar := bar_index
+    totalStrongBuy += 1
+
+    entry_price_long := close
+    if useATR
+        long_sl := entry_price_long - atr * atrSLmult
+        long_tp := entry_price_long + atr * atrTPmult
+    else
+        long_sl := entry_price_long * (1 - slPercDefault / 100)
+        long_tp := entry_price_long * (1 + tpPercDefault / 100)
+
+    strategy.entry("Long", strategy.long, qty=qty)
+    strategy.exit("Exit Long", from_entry="Long", stop=long_sl, limit=long_tp)
+
+// Short entry
+if strongSellSignal and strategy.position_size == 0 and canTrade
+    lastTradeBar := bar_index
+    totalStrongSell += 1
+
+    entry_price_short := close
+    if useATR
+        short_sl := entry_price_short + atr * atrSLmult
+        short_tp := entry_price_short - atr * atrTPmult
+    else
+        short_sl := entry_price_short * (1 + slPercDefault / 100)
+        short_tp := entry_price_short * (1 - tpPercDefault / 100)
+
+    strategy.entry("Short", strategy.short, qty=qty)
+    strategy.exit("Exit Short", from_entry="Short", stop=short_sl, limit=short_tp)
+
+// Optional mean-reversion exit (basis cross)
+if strategy.position_size > 0 and crossOverBasis
+    strategy.close("Long", comment="Basis cross exit")
+if strategy.position_size < 0 and crossUnderBasis
+    strategy.close("Short", comment="Basis cross exit")
+
+// -------------------- LABELS & METRICS --------------------
+getMetricsText() =>
+    "Vol%:" + str.tostring(math.round(volPercent)) +
+     "  Z:" + str.tostring(math.round(vol_z * 10) / 10) +
+     "  OBV:" + str.tostring(math.round(obv_mom_normalized * 10) / 10) + "%" +
+     "  Ratio:" + str.tostring(math.round(vol_ratio * 100) / 100) +
+     "\nQty:" + str.tostring(math.round(qty * 1000000)/1000000) + "  Cool:" + str.tostring(cooldownUse)
+
+if showLabels
+    metricsText = getMetricsText()
+    if strongBuySignal
+        label.new(bar_index, low, "🟢 STRONG BUY\n" + metricsText, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+    if strongSellSignal
+        label.new(bar_index, high, "🔴 STRONG SELL\n" + metricsText, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+// -------------------- STATS TABLE --------------------
+if showStatsTable
+    var table statsTable = table.new(position.bottom_right, 2, 4, bgcolor=color.new(color.black, 80))
+    if barstate.islast
+        table.cell(statsTable, 0, 0, "Metric", text_color=color.white, bgcolor=color.new(color.gray, 50))
+        table.cell(statsTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 50))
+        table.cell(statsTable, 0, 1, "Strong Buys", text_color=color.green)
+        table.cell(statsTable, 1, 1, str.tostring(totalStrongBuy))
+        table.cell(statsTable, 0, 2, "Strong Sells", text_color=color.red)
+        table.cell(statsTable, 1, 2, str.tostring(totalStrongSell))
+        table.cell(statsTable, 0, 3, "Cooldown Bars", text_color=color.white)
+        table.cell(statsTable, 1, 3, str.tostring(cooldownUse))
+
+// -------------------- END --------------------
